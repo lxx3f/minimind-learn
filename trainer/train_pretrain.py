@@ -19,6 +19,22 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 
 warnings.filterwarnings('ignore')
 
+# 1. 强制适配RTX 5090的sm_120算力
+os.environ["TORCH_CUDA_ARCH_LIST"] = "12.0"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+# 2. 屏蔽算力兼容警告（避免干扰训练日志）
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda")
+
+# 3. 关闭不兼容的优化，确保运行稳定
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
+
+# 4. 确认GPU可用
+assert torch.cuda.is_available(), "CUDA不可用，请检查PyTorch安装"
+torch.cuda.set_device(0)
+print(f"使用GPU: {torch.cuda.get_device_name(0)}")
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
