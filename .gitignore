@@ -4,3 +4,5 @@ website/
 docs-minimind/
 dataset/*.jsonl
 __pycache__
+.vscode/
+checkpoints/
