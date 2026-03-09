@@ -21,19 +21,32 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    """
+    单轮训练函数
+    参数说明：
+    epoch: 当前训练轮数（从0开始计数，与主循环的epoch保持一致）
+    loader: 数据加载器
+    iters: 本轮总迭代步数
+    start_step: 起始步数（用于续训）
+    wandb: 可选的wandb可视化工具对象
+    """
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
+        # 更新学习率
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        # 使用混合精度上下文（autocast_ctx在主函数中初始化，CPU时为nullcontext）
         with autocast_ctx:
+            # 前向传播
             res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
+        # 反向传播
         scaler.scale(loss).backward()
 
         if (step + 1) % args.accumulation_steps == 0:
@@ -45,6 +58,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
             optimizer.zero_grad(set_to_none=True)
 
+        # 打印日志
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
@@ -64,7 +78,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
-                         epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
+                         epoch=epoch, step=step, wandb=wandb, save_dir=args.ckp_save_dir, scaler=scaler)
             model.train()
             del state_dict
 
@@ -95,6 +109,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--ckp_save_dir", type=str, default='../checkpoints', help="检查点保存目录")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -105,7 +120,7 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir=args.ckp_save_dir) if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"

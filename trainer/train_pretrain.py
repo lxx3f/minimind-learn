@@ -2,14 +2,19 @@ import os
 import sys
 
 __package__ = "trainer" # 定义当前模块的包名，方便模块间引用
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))) # 增加系统路径，方便查找引用其他模块
+# 将当前文件所在目录的上一级目录添加到Python的模块搜索路径中
+# os.path.dirname(__file__)：获取当前文件所在目录
+# os.path.join(..., '..')：拼接上一级目录路径
+# os.path.abspath()：转换为绝对路径
+# sys.path.append()：添加到模块搜索路径
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))) 
 
 import argparse # 命令行参数解析
 import time # 计时
 import warnings # 警告处理
 import torch # PyTorch核心
 import torch.distributed as dist # 分布式训练
-from contextlib import nullcontext 
+from contextlib import nullcontext # 导入空上下文管理器，用于兼容CPU/GPU的混合精度上下文
 from torch import optim, nn # 优化器和神经网络模块
 from torch.nn.parallel import DistributedDataParallel # PyTorch 内置的分布式训练工具
 from torch.utils.data import DataLoader, DistributedSampler # 数据加载、分布式采样器
@@ -140,6 +145,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--ckp_save_dir", type=str, default='../checkpoints', help="检查点保存目录")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -150,7 +156,7 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir=args.ckp_save_dir) if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
