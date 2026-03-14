@@ -21,10 +21,25 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, tokenizer, lm_config, start_step=0, wandb=None):
+    """
+    单轮训练函数
+    Args:
+        epoch: 当前训练轮次
+        loader: 数据加载器
+        iters: 本轮总迭代次数
+        tokenizer: 分词器
+        lm_config: 模型配置
+        start_step: 起始步数（用于续训）
+        wandb: wandb日志记录器
+    """
+    # 获取特殊标记的token id
+    # 思考开始标记、思考结束标记、答案开始标记、答案结束标记
     start_of_think_ids = tokenizer('<think>').input_ids
     end_of_think_ids = tokenizer('</think>').input_ids
     start_of_answer_ids = tokenizer('<answer>').input_ids
     end_of_answer_ids = tokenizer('</answer>').input_ids
+
+    # 初始化交叉熵损失函数，reduction='none'表示不自动求和，保留每个位置的损失值
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     
@@ -36,18 +51,25 @@ def train_epoch(epoch, loader, iters, tokenizer, lm_config, start_step=0, wandb=
             param_group['lr'] = lr
 
         with autocast_ctx:
+            # 前向传播
             res = model(input_ids)
+            # 移位，去掉最后一个token
             shift_logits = res.logits[..., :-1, :].contiguous()
+            # 移位，去掉第一个token
             shift_labels = labels[..., 1:].contiguous()
+            # 计算原始损失：展平logits和labels以适应CrossEntropyLoss输入格式
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)).view(shift_labels.size())
-
+            
+            # 创建损失掩码：只计算label不为-100的位置的损失（-100为忽略标记）
             loss_mask = (shift_labels != -100).float()
+            # 找出所有特殊标记的位置（思考/答案的起止标记）
             sp_ids = torch.isin(shift_labels.view(-1),
                                 torch.tensor(start_of_think_ids + end_of_think_ids
                                              + start_of_answer_ids + end_of_answer_ids
                                              ).to(args.device))
             loss_mask_flat = loss_mask.view(-1)
             loss_mask_sum = loss_mask_flat.sum()
+            # 为特殊标记位置的损失赋予更高的权重（10倍），强化这些标记的学习
             loss_mask_flat[sp_ids] = 10
             loss_mask = loss_mask_flat.view(shift_labels.size())
             logits_loss = (loss * loss_mask).sum() / loss_mask_sum
@@ -63,6 +85,7 @@ def train_epoch(epoch, loader, iters, tokenizer, lm_config, start_step=0, wandb=
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
+        # 打印日志
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
@@ -112,6 +135,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Reasoning", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--ckp_save_dir", type=str, default='../checkpoints', help="检查点保存目录")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -122,7 +146,7 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir=args.ckp_save_dir) if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"

@@ -2,42 +2,44 @@
 #                                             MiniMind Config
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
 
+# 从transformers库导入预训练模型配置基类
 from transformers import PretrainedConfig
 
 
 class MiniMindConfig(PretrainedConfig):
+    # 定义模型类型标识，用于transformers库的模型注册和加载
     model_type = "minimind"
 
     def __init__(
             self,
-            dropout: float = 0.0,
-            bos_token_id: int = 1,
-            eos_token_id: int = 2,
-            hidden_act: str = 'silu',
-            hidden_size: int = 512,
-            intermediate_size: int = None,
-            max_position_embeddings: int = 32768,
-            num_attention_heads: int = 8,
-            num_hidden_layers: int = 8,
-            num_key_value_heads: int = 2,
-            vocab_size: int = 6400,
-            rms_norm_eps: float = 1e-05,
-            rope_theta: int = 1000000.0,
-            inference_rope_scaling: bool = False,
-            flash_attn: bool = True,
+            dropout: float = 0.0,  # 全局dropout概率，默认0（无随机失活）
+            bos_token_id: int = 1, # 句子开始标记(token)的ID
+            eos_token_id: int = 2, # 句子结束标记(token)的ID
+            hidden_act: str = 'silu', # 隐藏层激活函数（又称Swish），x*sigmoid(x)
+            hidden_size: int = 512, # 隐藏层维度
+            intermediate_size: int = None, # FFN中间层维度，None则自动计算
+            max_position_embeddings: int = 32768, # 最大位置编码长度
+            num_attention_heads: int = 8, # 注意力头总数
+            num_hidden_layers: int = 8, # 隐藏层数量，一个隐藏层就是一个transformer decoder块
+            num_key_value_heads: int = 2, # KV注意力头数（GQA机制）
+            vocab_size: int = 6400, # 词汇表大小
+            rms_norm_eps: float = 1e-05, # RMSNorm的epsilon值（防止除0）
+            rope_theta: int = 1000000.0, # RoPE位置编码的theta参数
+            inference_rope_scaling: bool = False, # 推理时是否启用RoPE长度外推
+            flash_attn: bool = True, # 是否启用FlashAttention（高效注意力）
             ####################################################
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
             ####################################################
-            use_moe: bool = False,
-            num_experts_per_tok: int = 2,
-            n_routed_experts: int = 4,
-            n_shared_experts: int = 1,
-            scoring_func: str = 'softmax',
-            aux_loss_alpha: float = 0.01,
-            seq_aux: bool = True,
-            norm_topk_prob: bool = True,
-            **kwargs
+            use_moe: bool = False, # 是否启用MoE（混合专家）机制
+            num_experts_per_tok: int = 2, # 每个token选择的专家数量
+            n_routed_experts: int = 4, # 路由专家总数
+            n_shared_experts: int = 1, # 共享专家数量（所有token都会使用）
+            scoring_func: str = 'softmax', # 专家选择的评分函数
+            aux_loss_alpha: float = 0.01, # 辅助损失的权重系数
+            seq_aux: bool = True, # 是否在序列级别计算辅助损失
+            norm_topk_prob: bool = True, # 是否归一化top-k专家的概率
+            **kwargs # 其他未定义的配置参数（兼容父类）
     ):
         super().__init__(**kwargs)
         self.dropout = dropout
@@ -87,33 +89,41 @@ import torch
 import torch.nn.init as init
 import torch.nn.functional as F
 from torch import nn
-from transformers.activations import ACT2FN
+from transformers.activations import ACT2FN # 激活函数映射表
 from typing import Optional, Tuple, List, Union
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
+# 定义RMSNorm归一化层（无偏置的LayerNorm）
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps # 防止除0的小值
+        self.weight = nn.Parameter(torch.ones(dim)) # 可学习的缩放参数（初始化为1）
 
     def _norm(self, x):
+        # RMSNorm公式：x / sqrt(mean(x^2) + eps)
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        # 先归一化（转float避免精度问题），再缩放，最后恢复原数据类型
         return self.weight * self._norm(x.float()).type_as(x)
 
 
+# 预计算RoPE位置编码的cos/sin值（优化推理速度）
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6,
                          rope_scaling: Optional[dict] = None):
+    # 计算基础频率：1 / (rope_base ^ (2i/dim))，i从0到dim/2-1
     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
+    # 如果启用RoPE长度外推（YaRN）
     if rope_scaling is not None:
+        # 提取外推配置参数
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
             rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
             rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), rope_scaling.get("attention_factor", 1.0)
         )
+        # 如果目标长度超过原始长度，应用YaRN调整
         if end / orig_max > 1.0:
             # YaRN: f'(i) = f(i)((1-γ) + γ/s), where γ∈[0,1] is linear ramp
             inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
@@ -128,15 +138,19 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
     return freqs_cos, freqs_sin
 
 
+# 对Q/K应用RoPE位置编码
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    # 辅助函数：将输入张量分为前后两半，后半取负，然后拼接
     def rotate_half(x):
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
 
+    # 应用RoPE公式：q*cos + rotate_half(q)*sin
     q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
     return q_embed, k_embed
 
 
+# 重复KV头以匹配Q头数量（GQA/MQA机制）
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, num_key_value_heads, head_dim = x.shape
@@ -147,37 +161,48 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
+# 定义注意力层（支持FlashAttention和KV Cache）
 class Attention(nn.Module):
     def __init__(self, args: MiniMindConfig):
         super().__init__()
+        # 设置KV头数（如果未指定则等于Q头数，即MHSA）
         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+        # 验证：Q头数必须是KV头数的整数倍（GQA要求）
         assert args.num_attention_heads % self.num_key_value_heads == 0
         self.n_local_heads = args.num_attention_heads
         self.n_local_kv_heads = self.num_key_value_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
+        # 定义Q/K/V/O投影层（无偏置）
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+        # Dropout层
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
+
+        # 判断是否启用FlashAttention（需要PyTorch>=2.0且配置开启）
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
         # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
     def forward(self,
-                x: torch.Tensor,
+                x: torch.Tensor, # 输入张量 [bs, seq_len, hidden_size]
                 position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # 修改为接收cos和sin
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
                 attention_mask: Optional[torch.Tensor] = None):
+        # 获取输入形状：bsz(批次大小) × seq_len(序列长度) × hidden_size
         bsz, seq_len, _ = x.shape
+        # Q/K/V投影：将输入映射到注意力头维度
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # 重塑为多头格式：[bsz, seq_len, n_heads, head_dim]
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
+        # 应用RoPE位置编码到Q/K
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
@@ -213,12 +238,16 @@ class Attention(nn.Module):
         return output, past_kv
 
 
+# 定义前馈网络（FFN），使用Gated Linear Units（GLU）结构
 class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
+        # 如果未指定中间层维度，自动计算（hidden_size * 8/3，且对齐64的倍数）
         if config.intermediate_size is None:
             intermediate_size = int(config.hidden_size * 8 / 3)
             config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+
+        # 定义GLU结构的投影层：gate_proj（门控）、up_proj（上投影）、down_proj（下投影）
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
@@ -229,6 +258,7 @@ class FeedForward(nn.Module):
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
 
+# 定义MoE（混合专家）的门控网络，负责选择专家
 class MoEGate(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -285,6 +315,7 @@ class MoEGate(nn.Module):
         return topk_idx, topk_weight, aux_loss
 
 
+# 定义MoE版本的前馈网络
 class MOEFeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -349,6 +380,7 @@ class MOEFeedForward(nn.Module):
         return expert_cache
 
 
+# 定义MiniMind的Transformer Block（包含注意力和FFN/MoE）
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
@@ -373,6 +405,7 @@ class MiniMindBlock(nn.Module):
         return hidden_states, present_key_value
 
 
+# 定义MiniMind模型主体（所有Transformer Block的堆叠）
 class MiniMindModel(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -424,6 +457,7 @@ class MiniMindModel(nn.Module):
         return hidden_states, presents, aux_loss
 
 
+# 定义MiniMind因果语言模型（包含生成功能）
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MiniMindConfig
 

@@ -15,6 +15,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import SFTDataset
+# 导入LoRA相关工具函数：保存LoRA权重、应用LoRA到模型
 from model.model_lora import save_lora, apply_lora
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
@@ -22,6 +23,16 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
+    """
+    单轮训练函数：完成一个epoch的训练过程
+    Args:
+        epoch: 当前训练轮数
+        loader: 数据加载器，提供训练数据
+        iters: 当前epoch的总迭代步数
+        lora_params: LoRA可训练参数列表
+        start_step: 起始迭代步数（续训时使用）
+        wandb: wandb日志记录对象（可选）
+    """
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
@@ -89,6 +100,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-LoRA", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--ckp_save_dir", type=str, default='../checkpoints', help="检查点保存目录")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -99,7 +111,7 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.lora_name, save_dir='../checkpoints') if args.from_resume==1 else None
+    ckp_data = lm_checkpoint(lm_config, weight=args.lora_name, save_dir=args.ckp_save_dir) if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"

@@ -22,36 +22,83 @@ warnings.filterwarnings('ignore')
 
 
 def logits_to_log_probs(logits, labels):
+    """
+    将模型输出的logits转换为对应标签的对数概率
+    Args:
+        logits: 模型输出的原始预测值，形状为 (batch_size, seq_len, vocab_size)
+        labels: 真实标签，形状为 (batch_size, seq_len)
+    Returns:
+        log_probs_per_token: 每个token对应的对数概率，形状为 (batch_size, seq_len)
+    """
     # logits shape: (batch_size, seq_len, vocab_size)
     # labels shape: (batch_size, seq_len)
     # log_probs shape: (batch_size, seq_len)
+
+    # 对logits在词汇表维度做softmax，再取对数，得到每个token的对数概率分布
+    # dim从0开始，这里的dim=2和dim=-1等效
     log_probs = F.log_softmax(logits, dim=2)
+    # unsqueeze(dim):为张量在指定维度上增加一个长度为 1 的新维度
+    # squeeze(dim):删除张量中所有长度为 1 的维度（如果指定 dim，则只删除该维度且仅当它长度为 1 时生效）
+    # 将labels增加一个维度，形状变为 (batch_size, seq_len, 1)，用于gather操作
+    # 使用gather从log_probs中取出对应标签位置的对数概率，最后去掉多余维度
     log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
+    # 返回每个token对应的对数概率
     return log_probs_per_token
 
 
 def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
+    """
+    计算DPO (Direct Preference Optimization) 损失函数
+    核心思想：让策略模型更喜欢被选中的回答(chosen)，不喜欢被拒绝的回答(rejected)
+    Args:
+        ref_log_probs: 参考模型的对数概率，形状 (batch_size, seq_len)
+        policy_log_probs: 策略模型（待训练）的对数概率，形状 (batch_size, seq_len)
+        mask: 注意力掩码，用于忽略padding部分，形状 (batch_size, seq_len)
+        beta: DPO的温度系数，控制偏好强度
+    Returns:
+        loss: 平均DPO损失值
+    """
     # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
     # https://github.com/jingyaogong/minimind/issues/298
-    seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)  # 防止零长度mask导致除零NaN
+    # 计算每个样本的有效序列长度（mask中1的数量），并限制最小值为1e-8防止除零错误
+    seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)  
+    # 计算参考模型在有效token上的平均对数概率（乘以mask忽略padding，求和后除以有效长度）
     ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    # 计算策略模型在有效token上的平均对数概率
     policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
 
-    # 将 chosen 和 rejected 数据分开
+    # 将批次中的数据分成chosen（前半部分）和rejected（后半部分）
     batch_size = ref_log_probs.shape[0]
     chosen_ref_log_probs = ref_log_probs[:batch_size // 2]
     reject_ref_log_probs = ref_log_probs[batch_size // 2:]
     chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
     reject_policy_log_probs = policy_log_probs[batch_size // 2:]
 
+    # 计算策略模型对chosen和rejected的偏好差值 (pi_chosen - pi_rejected)
     pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
+    # 计算参考模型对chosen和rejected的偏好差值 (ref_chosen - ref_rejected)
     ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
+    # DPO核心计算：策略模型相对参考模型的偏好差值
     logits = pi_logratios - ref_logratios
+    # sigmoid把数据映射到(0,1)区间内
+    # 计算DPO损失：-log(sigmoid(beta * logits))，鼓励策略模型偏好正确回答
     loss = -F.logsigmoid(beta * logits)
     return loss.mean()
 
 
 def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=0.1):
+    """
+    训练一个epoch的核心函数
+    Args:
+        epoch: 当前训练的epoch数
+        loader: 数据加载器
+        iters: 当前epoch的总迭代步数
+        ref_model: 参考模型（冻结，不参与训练）
+        lm_config: 模型配置类实例
+        start_step: 起始步数（用于续训）
+        wandb: wandb日志记录器实例
+        beta: DPO的beta参数
+    """
     start_time = time.time()
     
     for step, batch in enumerate(loader, start=start_step + 1):
@@ -145,6 +192,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-DPO", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--ckp_save_dir", type=str, default='../checkpoints', help="检查点保存目录")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -155,7 +203,7 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir=args.ckp_save_dir) if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"

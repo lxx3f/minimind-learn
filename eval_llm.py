@@ -10,7 +10,18 @@ from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
 def init_model(args):
+    """
+    初始化模型和分词器
+    Args:
+        args: 命令行参数对象，包含模型加载的所有配置
+    Returns:
+        model: 加载并配置好的生成式模型（eval模式）
+        tokenizer: 对应模型的分词器
+    """
+    # 从指定 path 路径下加载预定义的分词器配置文件(tokenizer_config.json)
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
+    
+    # 判断是否加载自定义的MiniMind模型（而非Hugging Face标准格式模型）
     if 'model' in args.load_from:
         model = MiniMindForCausalLM(MiniMindConfig(
             hidden_size=args.hidden_size,
@@ -18,15 +29,19 @@ def init_model(args):
             use_moe=bool(args.use_moe),
             inference_rope_scaling=args.inference_rope_scaling
         ))
+        # 根据是否使用MoE架构拼接权重文件名后缀
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
+        # 如果指定了LoRA权重（非None），则加载LoRA适配层
         if args.lora_weight != 'None':
             apply_lora(model)
             load_lora(model, f'./{args.save_dir}/lora/{args.lora_weight}_{args.hidden_size}.pth')
-    else:
+    else: # 否则加载Hugging Face标准格式的因果语言模型
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
+    # 打印模型参数信息（总参数量、可训练参数等）
     get_model_params(model, model.config)
+    # 将模型设置为eval模式（禁用dropout等训练层），并移动到指定设备（GPU/CPU）
     return model.eval().to(args.device), tokenizer
 
 def main():
@@ -58,13 +73,19 @@ def main():
         '推荐一些中国的美食'
     ]
     
+    # 初始化对话历史列表，用于存储多轮对话的用户/助手消息
     conversation = []
+    # 初始化模型和分词器
     model, tokenizer = init_model(args)
     input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
+    # 创建文本流式输出器：
+    # skip_prompt=True：跳过输入提示词的输出
+    # skip_special_tokens=True：跳过特殊标记（如<s>、</s>等）的输出
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     
     prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬: '), '')
     for prompt in prompt_iter:
+        # 设置随机种子为2026，保证生成结果可复现
         setup_seed(2026) # or setup_seed(random.randint(0, 2048))
         if input_mode == 0: print(f'💬: {prompt}')
         conversation = conversation[-args.historys:] if args.historys else []
@@ -83,6 +104,9 @@ def main():
             pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
             top_p=args.top_p, temperature=args.temperature, repetition_penalty=1.0
         )
+        # 解码生成的token id：
+        # 截取超出输入长度的部分（只保留模型生成的内容）
+        # skip_special_tokens=True：跳过特殊标记
         response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
         conversation.append({"role": "assistant", "content": response})
         gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
